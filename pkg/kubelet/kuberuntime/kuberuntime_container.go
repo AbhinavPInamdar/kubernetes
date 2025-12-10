@@ -412,11 +412,99 @@ func (m *kubeGenericRuntimeManager) updateContainerResources(ctx context.Context
 	if containerResources == nil {
 		return fmt.Errorf("container %q updateContainerResources failed: cannot generate resources config", containerID.String())
 	}
+
+	// TOCTOU Race Condition Fix: Validate memory usage immediately before applying new limits
+	// This minimizes the race window from potentially seconds/milliseconds to microseconds
+	if err := m.validateMemoryBeforeUpdate(ctx, pod, container, containerID, containerResources); err != nil {
+		return fmt.Errorf("container %q memory validation failed: %w", containerID.String(), err)
+	}
+
 	err := m.runtimeService.UpdateContainerResources(ctx, containerID.ID, containerResources)
 	if err == nil {
 		err = m.setActuatedContainerResources(pod, container)
 	}
 	return err
+}
+
+// validateMemoryBeforeUpdate performs just-in-time memory validation to minimize TOCTOU race window.
+// This function is called immediately before applying new memory limits to reduce the time window
+// where memory usage could increase between validation and limit application.
+func (m *kubeGenericRuntimeManager) validateMemoryBeforeUpdate(ctx context.Context, pod *v1.Pod, container *v1.Container, containerID kubecontainer.ContainerID, newResources *runtimeapi.ContainerResources) error {
+	// Only validate if memory limit is being decreased
+	if !m.isMemoryLimitDecreasing(ctx, container, newResources) {
+		return nil // No validation needed for increasing or unchanged limits
+	}
+
+	// Get current memory usage immediately before applying new limit (minimal race window)
+	containerStatus, err := m.runtimeService.ContainerStatus(ctx, containerID.ID, false)
+	if err != nil {
+		return fmt.Errorf("failed to get container status: %w", err)
+	}
+
+	if containerStatus.Status.Resources == nil || containerStatus.Status.Resources.Linux == nil {
+		// No current resource info available, allow the update
+		return nil
+	}
+
+	// Extract new memory limit
+	var newMemoryLimit int64
+	if newResources.Linux != nil {
+		newMemoryLimit = newResources.Linux.MemoryLimitInBytes
+	}
+
+	if newMemoryLimit <= 0 {
+		return nil // No memory limit being set
+	}
+
+	// Get current memory usage stats
+	podStatus := &kubecontainer.PodStatus{
+		ID:        pod.UID,
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}
+
+	podUsageStats, err := m.runtimeHelper.PodCPUAndMemoryStats(ctx, pod, podStatus)
+	if err != nil {
+		// If we can't get usage stats, log warning but allow update to proceed
+		// This maintains backward compatibility and avoids blocking legitimate updates
+		klog.V(4).InfoS("Unable to get memory usage stats for validation, allowing update to proceed", 
+			"pod", klog.KObj(pod), "container", container.Name, "error", err)
+		return nil
+	}
+
+	// Find this container's memory usage
+	for _, cStats := range podUsageStats.Containers {
+		if cStats.Name == container.Name {
+			if cStats.Memory != nil && cStats.Memory.UsageBytes != nil {
+				currentUsage := *cStats.Memory.UsageBytes
+				if currentUsage >= uint64(newMemoryLimit) {
+					return fmt.Errorf("current memory usage (%d bytes) exceeds new limit (%d bytes), update would cause OOM kill", 
+						currentUsage, newMemoryLimit)
+				}
+			}
+			break
+		}
+	}
+
+	return nil
+}
+
+// isMemoryLimitDecreasing checks if the new memory limit is lower than the current limit
+func (m *kubeGenericRuntimeManager) isMemoryLimitDecreasing(ctx context.Context, container *v1.Container, newResources *runtimeapi.ContainerResources) bool {
+	// Extract new memory limit
+	var newMemoryLimit int64
+	if newResources.Linux != nil {
+		newMemoryLimit = newResources.Linux.MemoryLimitInBytes
+	}
+
+	// Extract current memory limit from container spec
+	var currentMemoryLimit int64
+	if memLimit := container.Resources.Limits.Memory(); memLimit != nil {
+		currentMemoryLimit = memLimit.Value()
+	}
+
+	// Memory is decreasing if both limits exist and new < current
+	return currentMemoryLimit > 0 && newMemoryLimit > 0 && newMemoryLimit < currentMemoryLimit
 }
 
 func (m *kubeGenericRuntimeManager) setActuatedContainerResources(pod *v1.Pod, container *v1.Container) error {

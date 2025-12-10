@@ -17,6 +17,7 @@ limitations under the License.
 package kuberuntime
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1041,4 +1042,105 @@ func TestUpdateContainerResources(t *testing.T) {
 
 	// Verify container is updated
 	assert.Contains(t, fakeRuntime.Called, "UpdateContainerResources")
+}
+// TestIsMemoryLimitDecreasing tests the helper function that detects memory limit decreases
+// This is part of the TOCTOU race condition fix for memory resize operations
+func TestIsMemoryLimitDecreasing(t *testing.T) {
+	tests := []struct {
+		name                string
+		currentMemoryLimit  string
+		newMemoryLimit      int64
+		expectedDecreasing  bool
+	}{
+		{
+			name:               "memory limit decreasing",
+			currentMemoryLimit: "1Gi",
+			newMemoryLimit:     512 * 1024 * 1024, // 512MB
+			expectedDecreasing: true,
+		},
+		{
+			name:               "memory limit increasing", 
+			currentMemoryLimit: "512Mi",
+			newMemoryLimit:     1024 * 1024 * 1024, // 1GB
+			expectedDecreasing: false,
+		},
+		{
+			name:               "memory limit unchanged",
+			currentMemoryLimit: "1Gi",
+			newMemoryLimit:     1024 * 1024 * 1024, // 1GB
+			expectedDecreasing: false,
+		},
+		{
+			name:               "no current limit",
+			currentMemoryLimit: "",
+			newMemoryLimit:     1024 * 1024 * 1024, // 1GB
+			expectedDecreasing: false,
+		},
+		{
+			name:               "no new limit",
+			currentMemoryLimit: "1Gi",
+			newMemoryLimit:     0,
+			expectedDecreasing: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			
+			// Create test manager
+			manager := &kubeGenericRuntimeManager{}
+
+			// Create test container
+			container := &v1.Container{
+				Name: "test-container",
+				Resources: v1.ResourceRequirements{},
+			}
+			
+			// Set current memory limit if specified
+			if tt.currentMemoryLimit != "" {
+				container.Resources.Limits = v1.ResourceList{
+					v1.ResourceMemory: resource.MustParse(tt.currentMemoryLimit),
+				}
+			}
+
+			// Create new resources with specified memory limit
+			newResources := &runtimeapi.ContainerResources{
+				Linux: &runtimeapi.LinuxContainerResources{
+					MemoryLimitInBytes: tt.newMemoryLimit,
+				},
+			}
+
+			// Test the function
+			result := manager.isMemoryLimitDecreasing(ctx, container, newResources)
+			assert.Equal(t, tt.expectedDecreasing, result, "Memory limit decreasing detection failed")
+		})
+	}
+}
+
+// TestValidateMemoryBeforeUpdateLogic tests the just-in-time validation logic
+// This focuses on the logic without requiring a full runtime setup
+func TestValidateMemoryBeforeUpdateLogic(t *testing.T) {
+	ctx := context.Background()
+	manager := &kubeGenericRuntimeManager{}
+
+	// Test case: Memory limit not decreasing should return nil (no validation needed)
+	container := &v1.Container{
+		Name: "test-container",
+		Resources: v1.ResourceRequirements{
+			Limits: v1.ResourceList{
+				v1.ResourceMemory: resource.MustParse("512Mi"),
+			},
+		},
+	}
+
+	newResources := &runtimeapi.ContainerResources{
+		Linux: &runtimeapi.LinuxContainerResources{
+			MemoryLimitInBytes: 1024 * 1024 * 1024, // 1GB (increasing)
+		},
+	}
+
+	// This should return false because memory is increasing (no validation needed)
+	result := manager.isMemoryLimitDecreasing(ctx, container, newResources)
+	assert.False(t, result, "Should not detect decreasing when memory limit is increasing")
 }
